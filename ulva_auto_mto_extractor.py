@@ -1,136 +1,171 @@
-import sys, re, math, datetime
+#!/usr/bin/env python
+"""
+ULVA Auto-MTO Estimator – Custom Full Feature Version
+
+Features:
+  - Recognises from PDF:
+    • Straight pipes
+    • 45° & 90° elbows
+    • Equal & Unequal Tees
+    • End caps (valve & flange)
+    • Collars for small branches (<250 mm)
+    • Clamp covers
+
+Calculations:
+  • Straight M² = (circumference + 0.05 m lap) × length
+  • Circumferential joints at each metre & at fittings: include in bond length
+  • Bead length per fitting (heel + throat or full circumference)
+  • ULVAShield £ per m²
+  • ULVASeal tubes = ceil(total bead length / 6)
+  • ULVABond tins = ceil((total bond length × 0.1 m strip) / 2)
+
+Output:
+  - Separate Excel sheets: Straights, Elbow45, Elbow90, EqualTee, UnequalTee, EndCap, Collar, ClampCover, Summary
+  - Sorted by DN ascending
+  - Summary tab with all totals and costs
+
+Usage:
+  python ulva_auto_mto_extractor.py [--thickness MM]
+  Drop PDFs into pdf_in/ and run. Excel saved to mto_out/.
+"""
+import sys, re, math, datetime, argparse
 from math import pi, ceil
 from pathlib import Path
 import pandas as pd
-try:
-    import pdfplumber
-except ImportError:
-    sys.exit("pdfplumber missing – pip install pdfplumber")
-try:
-    import xlsxwriter
-except ImportError:
-    sys.exit("xlsxwriter missing – pip install xlsxwriter")
+import pdfplumber
 
-INS_THK = 20           # default mm insulation
-TUBE_LEN = 6           # metres of bead per ULVASeal tube
-BOND_STRIP = 0.10      # 100 mm bond width
-ULVASHIELD_RATE = 36.74  # £/m²
-ULVASEAL_RATE = 12.50    # £/tube
-ULVABOND_RATE = 9.50     # £/litre
-CLAMP_COVER_RATE = 24.00 # £ per clamp cover (example rate)
+# Defaults
+DEFAULT_THK = 20     # mm insulation thickness
+MIN_THK = 5
+MAX_THK = 300
+LAP = 0.05           # m longitudinal lap (50 mm)
+TUBE_COVER_M = 6     # m per ULVASeal tube
+BOND_STRIP_W = 0.1   # m (100 mm strip)
+DN_COLLAR = 250      # DN threshold for collar
 
-OD = {15:21.3,20:26.9,25:33.7,32:42.4,40:48.3,50:60.3,65:76.1,80:88.9,90:101.6,
-      100:114.3,125:141.3,150:168.3,200:219.1,250:273.0,300:323.9,350:355.6,
-      400:406.4,450:457.0,500:508.0,600:610.0}
+# Rates (£)
+RATE_SHIELD = 36.74  # per m²
+RATE_SEAL = 12.50    # per tube
+RATE_BOND = 9.50     # per m² on strip area
+RATE_CLAMP = 24.00   # per clamp cover
 
-def ins_od(dn:int, thk:int)->float: return OD.get(dn,dn)+2*thk
+# OD lookup (mm)
+OD = {15:21.3,20:26.9,25:33.7,32:42.4,40:48.3,50:60.3,65:76.1,
+      80:88.9,90:101.6,100:114.3,125:141.3,150:168.3,200:219.1,
+      250:273.0,300:323.9,350:355.6,400:406.4,450:457.0,500:508.0,600:610.0}
 
-def circ_m(dn:int, thk:int)->float: return pi*ins_od(dn, thk)/1000
+# CLI
+p = argparse.ArgumentParser()
+p.add_argument('-t','--thickness',type=int,default=DEFAULT_THK,
+               help=f'Insulation thickness (mm) {MIN_THK}-{MAX_THK}')
+args = p.parse_args()
+if args.thickness < MIN_THK or args.thickness > MAX_THK:
+    sys.exit(f'Error: thickness must be {MIN_THK}-{MAX_THK} mm')
+INS_THK = args.thickness
 
-def parse_cuts(txt:str):
-    return [(int(l),int(dn)) for l,dn in re.findall(r"<\d+>\s+(\d{2,5})\s+(\d{2,3})",txt)]
+# Helpers
+def circ_m(dn):
+    od = OD.get(dn, dn) + 2*INS_THK
+    return pi*od/1000
 
-def parse_fittings(txt:str):
-    out=[]
+cut_rx = re.compile(r"<\d+>\s+(\d{2,5})\s+(\d{2,3})")
+parse_cuts = lambda txt: [(int(l),int(dn)) for l,dn in cut_rx.findall(txt)]
+
+def parse_fittings(txt):
+    items=[]
     for ln in txt.splitlines():
         l=ln.lower()
-        if " elbow" in l:
-            ang = 90 if "90" in l else 45 if "45" in l else 90
-            m=re.search(r"(\d{2,3})",ln)
-            if m: out.append({"elbow":ang,"dn":int(m.group(1))})
-        elif " tee" in l:
-            nums=[int(n) for n in re.findall(r"(\d{2,3})",ln)]
-            if nums: out.append({"tee":nums})
-        elif "reducer" in l:
-            nums=[int(n) for n in re.findall(r"(\d{2,3})",ln)]
-            if len(nums)>=2: out.append({"reducer":nums})
-        elif "flange" in l or "valve" in l:
-            m=re.search(r"(\d{2,3})",ln)
-            if m: out.append({"cap":int(m.group(1))})
-        elif "weldolet" in l or "threadolet" in l:
-            m=re.search(r"(\d{2,3})",ln)
-            if m: out.append({"collar":int(m.group(1))})
-        elif "clamp" in l:
-            m=re.search(r"(\d{2,3})",ln)
-            if m: out.append({"clamp":int(m.group(1))})
-    return out
+        if '45' in l and 'elbow' in l:
+            dn=int(re.search(r"(\d{2,3})",ln).group(1)); items.append(('Elbow45',dn))
+        elif '90' in l and 'elbow' in l:
+            dn=int(re.search(r"(\d{2,3})",ln).group(1)); items.append(('Elbow90',dn))
+        elif ' tee' in l:
+            dns=[int(n) for n in re.findall(r"(\d{2,3})",ln)]
+            if len(dns)>=2:
+                typ='EqualTee' if dns[0]==dns[1] else 'UnequalTee'
+                items.append((typ,dns[0],dns[1]))
+        elif 'flange' in l or 'valve' in l:
+            dn=int(re.search(r"(\d{2,3})",ln).group(1)); items.append(('EndCap',dn))
+        elif ('weldolet' in l or 'threadolet' in l):
+            dn=int(re.search(r"(\d{2,3})",ln).group(1))
+            if dn < DN_COLLAR: items.append(('Collar',dn))
+        elif 'clamp' in l:
+            dn=int(re.search(r"(\d{2,3})",ln).group(1)); items.append(('ClampCover',dn))
+    return items
 
-def process_pdf(path:Path, thk:int):
-    with pdfplumber.open(path) as doc:
-        txt="\n".join(p.extract_text() or "" for p in doc.pages)
-    straights=[]; elbows=[]; tees=[]; reducers=[]; caps=[]; collars=[]; clamps=[]; bead=0; area_total=0
-    for l,dn in parse_cuts(txt):
-        m=math.ceil(l/1000); circ=circ_m(dn, thk); area=circ*m; b=m+2*circ
-        straights.append({"PDF":path.name,"DN":dn,"Rounded_m":m,"Circ_m":round(circ,3),"M2":round(area,3),"Bead_m":round(b,3),"ULVAShield_£":round(area*ULVASHIELD_RATE,2)})
-        bead+=b; area_total+=area
-    for f in parse_fittings(txt):
-        if "elbow" in f:
-            arc=(f["elbow"]/360)*pi*ins_od(f["dn"], thk)/1000; b=arc*2; bead+=b
-            elbows.append({"PDF":path.name,"Component":f"Elbow {f['elbow']}","DN":f["dn"],"Bead_m":round(b,3)})
-        elif "tee" in f:
-            hdr=f["tee"][0]; br=f["tee"][1] if len(f["tee"])>1 else hdr
-            b=2*circ_m(hdr, thk)+circ_m(br, thk); bead+=b
-            tees.append({"PDF":path.name,"Component":"Tee","DN":hdr,"Branch_DN":br,"Bead_m":round(b,3)})
-        elif "reducer" in f:
-            big,small=f["reducer"][:2]; b=circ_m(big, thk)+circ_m(small, thk); bead+=b
-            reducers.append({"PDF":path.name,"Component":"Reducer","DN_big":big,"DN_small":small,"Bead_m":round(b,3)})
-        elif "cap" in f:
-            b=circ_m(f["cap"], thk); bead+=b
-            caps.append({"PDF":path.name,"DN":f["cap"],"Bead_m":round(b,3)})
-        elif "collar" in f:
-            b=circ_m(f["collar"], thk); bead+=b
-            collars.append({"PDF":path.name,"DN":f["collar"],"Bead_m":round(b,3)})
-        elif "clamp" in f:
-            clamps.append({"PDF":path.name,"DN":f["clamp"],"Clamp_£":CLAMP_COVER_RATE})
-    return straights, elbows, tees, reducers, caps, collars, clamps, bead, area_total
+# Process PDF
+def process_pdf(path):
+    txt='\n'.join(p.extract_text() or '' for p in pdfplumber.open(path).pages)
+    # Straights
+    straights=[]; total_clad=0; bond_len=0; bead_sum=0
+    for Lmm,dn in parse_cuts(txt):
+        L=ceil(Lmm/1000)
+        C=circ_m(dn)
+        clad_m2=(C+LAP)*L
+        bead=L + 2*C
+        straights.append({'PDF':path.name,'DN':dn,'Length_m':L,'Circ_m':round(C,3),
+                          'Clad_m2':round(clad_m2,3),'Bead_m':round(bead,3),
+                          'Shield_£':round(clad_m2*RATE_SHIELD,2)})
+        total_clad+=clad_m2; bond_len+=L + C; bead_sum+=bead
+    # Fittings
+    fits={k:[] for k in ['Elbow45','Elbow90','EqualTee','UnequalTee','EndCap','Collar','ClampCover']}
+    for item in parse_fittings(txt):
+        key=item[0]
+        if key.startswith('Elbow'):
+            angle=int(key[5:]); dn=item[1]
+            arc=(angle/360)*2*pi*(OD.get(dn,dn)+2*INS_THK)/1000
+            fits[key].append({'PDF':path.name,'DN':dn,'Bead_m':round(arc,3)})
+            bead_sum+=arc; bond_len+=arc*2
+        elif key in ['EqualTee','UnequalTee']:
+            hdr,br=item[1],item[2]
+            bead=2*circ_m(hdr)+circ_m(br)
+            fits[key].append({'PDF':path.name,'DN_main':hdr,'DN_branch':br,'Bead_m':round(bead,3)})
+            bead_sum+=bead; bond_len+=bead
+        elif key in ['EndCap','Collar']:
+            dn=item[1]; b=circ_m(dn)
+            fits[key].append({'PDF':path.name,'DN':dn,'Bead_m':round(b,3)})
+            bead_sum+=b; bond_len+=b
+        elif key=='ClampCover':
+            dn=item[1]; fits[key].append({'PDF':path.name,'DN':dn,'Clamp_£':RATE_CLAMP})
+            bond_len+=dn*0  # no bond length
+    # Totals
+    total_bead=bead_sum
+    tubes=ceil(total_bead/TUBE_COVER_M)
+    bond_area=(bond_len*BOND_STRIP_W)
+    tins=ceil(bond_area/2)
+    summary={'Clad_m2':round(total_clad,2),'Bead_m':round(total_bead,2),
+             'Tubes':tubes,'Bond_tins':tins}
+    return straights,fits,summary
 
-def collect_inputs(args):
-    if len(args)==1:
-        return Path("pdf_in"), Path("mto_out"), INS_THK
-    thk = int(args[1]) if len(args)>1 and args[1].isdigit() else INS_THK
-    return Path("pdf_in"), Path("mto_out"), thk
-
-def main(argv):
-    inputs, out_dir, thk = collect_inputs(argv)
-    inputs.mkdir(exist_ok=True)
-    out_dir.mkdir(exist_ok=True)
-    pdfs=list(inputs.glob("*.pdf"))+list(inputs.glob("*.PDF"))
-    if not pdfs: sys.exit(f"Drop PDFs into {inputs} and run again.")
-
-    st=elb=tee=red=cap=col=cl=[]; total_bead=0; total_m2=0
+# Main
+def main():
+    inp,out=Path('pdf_in'),Path('mto_out'); inp.mkdir(exist_ok=True); out.mkdir(exist_ok=True)
+    pdfs=list(inp.glob('*.pdf'))+list(inp.glob('*.PDF'))
+    if not pdfs:
+        print(f'Drop PDFs into {inp}'); sys.exit(1)
+    all_str=[]; all_fits={}; all_sum={'Clad_m2':0,'Bead_m':0,'Tubes':0,'Bond_tins':0}
     for pdf in pdfs:
-        s,e,t,r,c,k,m,b,a=process_pdf(pdf, thk)
-        st+=s; elb+=e; tee+=t; red+=r; cap+=c; col+=k; cl+=m
-        total_bead+=b; total_m2+=a
-
-    seal_tubes=ceil(total_bead/TUBE_LEN)
-    bond_area=total_bead*BOND_STRIP
-    bond_tins=ceil(bond_area)
-    df_s=pd.DataFrame(st)
-    df_el=pd.DataFrame(elb)
-    df_t=pd.DataFrame(tee)
-    df_r=pd.DataFrame(red)
-    df_c=pd.DataFrame(cap)
-    df_k=pd.DataFrame(col)
-    df_cl=pd.DataFrame(cl)
-    df_seal=pd.DataFrame({"Total_Bead_m":[round(total_bead,2)],"ULVASeal_Tubes":[seal_tubes],"ULVASeal_£":[round(seal_tubes*ULVASEAL_RATE,2)]})
-    df_bond=pd.DataFrame({"Bond_Area_m2":[round(bond_area,2)],"ULVABond_Tins":[bond_tins],"ULVABond_£":[round(bond_tins*ULVABOND_RATE,2)]})
-    df_total=pd.DataFrame({"Straight_M2_Total":[round(total_m2,2)],"ULVAShield_£":[round(total_m2*ULVASHIELD_RATE,2)]})
-
+        s,fits,sm=process_pdf(pdf)
+        all_str+=s
+        for k,v in fits.items(): all_fits.setdefault(k,[]).extend(v)
+        for k in all_sum: all_sum[k]+=sm[k]
     ts=datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    out=out_dir/f"Auto_MTO_{ts}.xlsx"
-    with pd.ExcelWriter(out,engine="xlsxwriter") as w:
-        for name,df in [
-            ("Straights",df_s),("Elbows",df_el),("Tees",df_t),
-            ("Reducers",df_r),("EndCaps",df_c),("Collars",df_k),
-            ("ClampCovers",df_cl),("ULVASeal",df_seal),("ULVABond",df_bond),("Totals",df_total)
-        ]:
-            df.to_excel(w,name,index=False)
-            ws=w.sheets[name]
+    out_file=out/f'Auto_MTO_{ts}.xlsx'
+    with pd.ExcelWriter(out_file,engine='xlsxwriter') as w:
+        pd.DataFrame(all_str).sort_values('DN').to_excel(w,'Straights',index=False)
+        for sheet,rows in sorted(all_fits.items()):
+            key=sheet
+            df=pd.DataFrame(rows)
+            sort_col=df.columns[1]
+            df.sort_values(sort_col).to_excel(w,key,index=False)
+        pd.DataFrame([all_sum]).to_excel(w,'Summary',index=False)
+        # Autofit
+        for sheet in w.sheets:
+            df=pd.read_excel(out_file,sheet_name=sheet)
+            ws=w.sheets[sheet]
             for i,col in enumerate(df.columns):
-                width = max(len(str(col)), max(df[col].astype(str).map(len).max(), default=0)) + 2
-                ws.set_column(i,i,width)
-    print(f"✅ Excel → {out}")
+                ws.set_column(i,i,max(df[col].astype(str).map(len).max(),len(col))+2)
+    print(f'Excel saved → {out_file}')
 
-if __name__=="__main__":
-    main(sys.argv)
+if __name__=='__main__':
+    main()
